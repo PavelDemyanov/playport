@@ -15,7 +15,8 @@
 //          (host_pad_set, slot 0) while held;
 //   opacity   the touch pad's and these buttons': 100 -> 75 -> 50 -> 30 %.
 // While the menu is open the touch pad is hidden and the menu's rows take taps.
-// Log: Documents/playport-touchpad.log.
+// Before the runtime starts it also sets MADEIRA_KEEP_SMC and WINEDLLOVERRIDES
+// (runtime_environment). Log: Documents/playport-touchpad.log.
 
 #import <GameController/GameController.h>
 #import <UIKit/UIKit.h>
@@ -78,6 +79,7 @@ static void resolve_playport(void)
     menu_shared_addressor = (menu_addressor_fn)dlsym(self, "$s8Playport10InGameMenuC6sharedACvau");
     menu_open_ptr = (menu_method_fn)dlsym(self, "$s8Playport10InGameMenuC4openSbyF");
     menu_is_open_ptr = (menu_method_fn)dlsym(self, "$s8Playport10InGameMenuC6isOpenSbvg");
+    tp_log(@"environment: MADEIRA_KEEP_SMC=%s WINEDLLOVERRIDES=%s", getenv("MADEIRA_KEEP_SMC"), getenv("WINEDLLOVERRIDES"));
     tp_log(@"Playport entry points: host_pad_set %s, InGameMenu.shared %s, open %s, isOpen %s",
            host_pad_set_ptr ? "ok" : "MISSING", menu_shared_addressor ? "ok" : "MISSING",
            menu_open_ptr ? "ok" : "MISSING", menu_is_open_ptr ? "ok" : "MISSING");
@@ -416,9 +418,23 @@ static void touch_pad_start(void)
     touch_pad_update(@"start");
 }
 
+/* Before the runtime starts (the library loads before main):
+ * - MADEIRA_KEEP_SMC=1: FEX in 0.4.0, with SMC tracking off once Mono is found,
+ *   breaks Mono (Unity 2019's String.Replace reads at a character's value);
+ *   fex 0033/0038 on main address that;
+ * - WINEDLLOVERRIDES: Playport sets windows.gaming.input=d only when the variable
+ *   is unset (HostIO.start, setenv(..., 0)); with the host pad provider, games on
+ *   Rewired need Windows.Gaming.Input. Playport or a game still overrides it. */
+static void runtime_environment(void)
+{
+    setenv("MADEIRA_KEEP_SMC", "1", 0);
+    setenv("WINEDLLOVERRIDES", "winemenubuilder.exe=d", 0);
+}
+
 __attribute__((constructor))
 static void touch_pad_init(void)
 {
+    runtime_environment();
     /* The overlay needs the app's window: start once the app is active the first time. */
     __block id observer = [NSNotificationCenter.defaultCenter
         addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue
