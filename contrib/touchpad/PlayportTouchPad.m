@@ -13,7 +13,9 @@
 //          Resume, Quit game;
 //   Back / Start   their XInput bits added to the touch pad's state
 //          (host_pad_set, slot 0) while held;
-//   opacity   the touch pad's and these buttons': 100 -> 75 -> 50 -> 30 %.
+//   opacity   the touch pad's and these buttons': 100 -> 75 -> 50 -> 30 %;
+//          held, it turns the touch pad off, all of it (it disconnects, so no
+//          invisible touch areas stay) leaving only this button, or back on.
 // While the menu is open the touch pad is hidden and the menu's rows take taps.
 // Before the runtime starts it also sets MADEIRA_KEEP_SMC and WINEDLLOVERRIDES
 // (runtime_environment). Log: Documents/playport-touchpad.log.
@@ -50,6 +52,13 @@ static uint16_t held_bits;
 static CADisplayLink *held_link;
 static CGFloat opacity = 1.0;
 static NSString *const opacity_key = @"PlayportTouchPadOpacity";
+/* Turned off by the player (the opacity button held): the touch pad is
+ * disconnected, all of it; only that button stays. */
+static BOOL player_hidden;
+static NSString *const hidden_key = @"PlayportTouchPadHidden";
+static UIButton *home_button, *back_button, *start_button, *opacity_button;
+static BOOL opacity_button_shows_pad;
+static GCController *touch_controller;  /* the touch pad's GCController while connected */
 
 static void tp_log(NSString *format, ...)
 {
@@ -140,6 +149,8 @@ static void send_pad_state(void)
 @interface TPTarget : NSObject
 @end
 
+static void touch_pad_update(NSString *reason);
+
 static TPTarget *target;
 
 /* ---- the overlay: system pad view, our buttons ---- */
@@ -170,17 +181,33 @@ static NSArray<UIView *> *controller_views(void)
     return found;
 }
 
+static BOOL physical_pad_present(void);
+
+static void set_opacity_button_icon(BOOL pad)
+{
+    UIImageSymbolConfiguration *config;
+
+    if (pad == opacity_button_shows_pad) return;
+    opacity_button_shows_pad = pad;
+    config = [UIImageSymbolConfiguration configurationWithPointSize:17 weight:UIImageSymbolWeightSemibold];
+    [opacity_button setImage:[UIImage systemImageNamed:pad ? @"gamecontroller.fill" : @"circle.lefthalf.filled"
+                                     withConfiguration:config] forState:UIControlStateNormal];
+}
+
 static void apply_overlay_state(void)
 {
     BOOL menu = menu_is_open();
-    BOOL shown = touch_pad_connected && !menu;
+    BOOL shown = !menu && !physical_pad_present() && (touch_pad_connected || player_hidden);
 
     for (UIView *view in controller_views())
     {
         view.alpha = opacity;
         view.hidden = menu;
     }
-    button_bar.alpha = opacity;
+    /* hidden views take no touches: off means off, not invisible */
+    home_button.hidden = back_button.hidden = start_button.hidden = player_hidden;
+    set_opacity_button_icon(player_hidden);
+    button_bar.alpha = player_hidden ? MAX(opacity, 0.6) : opacity;
     button_window.hidden = !shown;
 }
 
@@ -246,9 +273,28 @@ static void apply_overlay_state(void)
 
 - (void)opacityTapped
 {
+    if (player_hidden) return;
     opacity = opacity > 0.9 ? 0.75 : opacity > 0.6 ? 0.5 : opacity > 0.4 ? 0.3 : 1.0;
     [NSUserDefaults.standardUserDefaults setDouble:opacity forKey:opacity_key];
     tp_log(@"opacity %.0f%%", opacity * 100);
+    apply_overlay_state();
+}
+
+/* Held: the touch pad off, all of it (it disconnects, its overlay and touches go), or back on. */
+- (void)opacityLongPress:(UILongPressGestureRecognizer *)gesture
+{
+    if (gesture.state != UIGestureRecognizerStateBegan) return;
+    player_hidden = !player_hidden;
+    [NSUserDefaults.standardUserDefaults setBool:player_hidden forKey:hidden_key];
+    [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium] impactOccurred];
+    if (player_hidden && held_bits)
+    {
+        held_bits = 0;
+        [held_link invalidate];
+        held_link = nil;
+        send_pad_state();
+    }
+    touch_pad_update(player_hidden ? @"turned off by the player" : @"turned on by the player");
     apply_overlay_state();
 }
 
@@ -293,12 +339,15 @@ static void buttons_start(void)
     root.view.backgroundColor = UIColor.clearColor;
     button_window.rootViewController = root;
 
-    UIStackView *bar = [[UIStackView alloc] initWithArrangedSubviews:@[
-        make_button(@"house.fill", @selector(homeTapped), NULL),
-        make_button(@"rectangle.on.rectangle", @selector(backDown), @selector(backUp)),
-        make_button(@"line.3.horizontal", @selector(startDown), @selector(startUp)),
-        make_button(@"circle.lefthalf.filled", @selector(opacityTapped), NULL),
-    ]];
+    home_button = make_button(@"house.fill", @selector(homeTapped), NULL);
+    back_button = make_button(@"rectangle.on.rectangle", @selector(backDown), @selector(backUp));
+    start_button = make_button(@"line.3.horizontal", @selector(startDown), @selector(startUp));
+    opacity_button = make_button(@"circle.lefthalf.filled", @selector(opacityTapped), NULL);
+    UILongPressGestureRecognizer *hold = [[UILongPressGestureRecognizer alloc] initWithTarget:target
+                                                                                        action:@selector(opacityLongPress:)];
+    hold.minimumPressDuration = 0.6;
+    [opacity_button addGestureRecognizer:hold];  /* cancels the tap once recognised */
+    UIStackView *bar = [[UIStackView alloc] initWithArrangedSubviews:@[home_button, back_button, start_button, opacity_button]];
     bar.axis = UILayoutConstraintAxisHorizontal;
     bar.spacing = 14;
     bar.translatesAutoresizingMaskIntoConstraints = NO;
@@ -309,7 +358,7 @@ static void buttons_start(void)
 
     button_window.hidden = NO;
     [NSTimer scheduledTimerWithTimeInterval:0.5 target:target selector:@selector(tick) userInfo:nil repeats:YES];
-    tp_log(@"buttons shown: Home, Back, Start, opacity %.0f%%", opacity * 100);
+    tp_log(@"buttons shown: Home, Back, Start, opacity %.0f%%%@", opacity * 100, player_hidden ? @"; touch pad off" : @"");
 }
 
 /* ---- the system pad ---- */
@@ -328,7 +377,7 @@ static BOOL physical_pad_present(void)
 {
     for (GCController *controller in GCController.controllers)
     {
-        if (touch_pad && controller == touch_pad.controller) continue;
+        if (controller == touch_controller || (touch_pad && controller == touch_pad.controller)) continue;
         if (controller.extendedGamepad) return YES;
     }
     return NO;
@@ -338,14 +387,14 @@ static void touch_pad_update(NSString *reason)
 {
     BOOL physical = physical_pad_present();
 
-    if (physical && touch_pad_connected)
+    if ((physical || player_hidden) && touch_pad_connected)
     {
         [touch_pad disconnect];
         touch_pad_connected = NO;
-        tp_log(@"%@: a physical pad is connected, touch pad hidden", reason);
+        tp_log(@"%@: %@, touch pad disconnected", reason, physical ? @"a physical pad is connected" : @"off");
         apply_overlay_state();
     }
-    else if (!physical && !touch_pad_connected)
+    else if (!physical && !player_hidden && !touch_pad_connected)
     {
         touch_pad_connected = YES;
         [touch_pad connectWithReplyHandler:^(NSError *error) {
@@ -356,6 +405,7 @@ static void touch_pad_update(NSString *reason)
             }
             else
             {
+                touch_controller = touch_pad.controller;
                 tp_log(@"%@: touch pad shown (%@)", reason, touch_pad.controller.vendorName);
                 apply_overlay_state();
             }
@@ -398,6 +448,7 @@ static void touch_pad_start(void)
     resolve_playport();
     NSNumber *saved = [NSUserDefaults.standardUserDefaults objectForKey:opacity_key];
     if (saved) opacity = saved.doubleValue;
+    player_hidden = [NSUserDefaults.standardUserDefaults boolForKey:hidden_key];
     if (!(touch_pad = touch_pad_create())) return;
     buttons_start();
 
@@ -405,14 +456,14 @@ static void touch_pad_start(void)
     [nc addObserverForName:GCControllerDidConnectNotification object:nil queue:NSOperationQueue.mainQueue
                 usingBlock:^(NSNotification *note) {
         GCController *controller = note.object;
-        if (controller == touch_pad.controller) return;
+        if (controller == touch_controller || controller == touch_pad.controller) return;
         log_controllers([NSString stringWithFormat:@"did connect \"%@\"", controller.vendorName]);
         touch_pad_update([NSString stringWithFormat:@"connected \"%@\"", controller.vendorName]);
     }];
     [nc addObserverForName:GCControllerDidDisconnectNotification object:nil queue:NSOperationQueue.mainQueue
                 usingBlock:^(NSNotification *note) {
         GCController *controller = note.object;
-        if (controller == touch_pad.controller) return;
+        if (controller == touch_controller || controller == touch_pad.controller) return;
         touch_pad_update([NSString stringWithFormat:@"disconnected \"%@\"", controller.vendorName]);
     }];
     touch_pad_update(@"start");

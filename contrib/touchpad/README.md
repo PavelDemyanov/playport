@@ -27,6 +27,9 @@ the opacity steps.
   - **Opacity** steps the touch pad and the buttons through 100 → 75 → 50 → 30 %. The touch pad
     is the system's `GCControllerView`, found in the window tree and given an `alpha`. The choice
     is kept in `NSUserDefaults`.
+  - **Opacity held** (0.6 s) turns the touch pad off, all of it: it disconnects, so its overlay and
+    its touch areas go. Home, Back and Start hide, and only this button stays, now showing a pad.
+    Held again, everything is back. This choice is kept too.
 
 Games that read pads only as XInput work with this alone. Games that find pads through the raw
 input HID list or through Windows.Gaming.Input (Unity's raw input, Rewired; Anger Foot is one)
