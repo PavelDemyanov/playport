@@ -1,0 +1,117 @@
+From 18e61d6727bb3b57b66b35fdc610198391d68dd1 Mon Sep 17 00:00:00 2001
+From: Pavel Demyanov <greypax@cybergusli.ai>
+Date: Fri, 23 Oct 2026 11:50:13 +0300
+Subject: [PATCH 2/4] kernelbase: Decommit only whole 16 KiB host pages in an
+ i386 program.
+
+iOS pages are 16 KiB. WoW64 rounds a 4 KiB-aligned MEM_DECOMMIT out to
+whole host pages and so wipes live 4 KiB neighbours: Half-Life 2's tier0
+small-block heap decommits the tails of its pools and crashed. VirtualFreeEx
+on the current process now decommits only the inner whole 16 KiB pages and
+zeroes the committed, writable edges. Playport's main fixes the same in
+madeira-unix 0107.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/kernelbase/memory.c | 77 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 77 insertions(+)
+
+diff --git a/dlls/kernelbase/memory.c b/dlls/kernelbase/memory.c
+index 97e6bf5..3b90869 100644
+--- a/dlls/kernelbase/memory.c
++++ b/dlls/kernelbase/memory.c
+@@ -555,14 +555,91 @@ BOOL WINAPI DECLSPEC_HOTPATCH VirtualFree( void *addr, SIZE_T size, DWORD type )
+ /***********************************************************************
+  *             VirtualFreeEx   (kernelbase.@)
+  */
++#ifdef __i386__
++/* Playport: a decommit that is not whole 16 KiB pages, in an i386 program.
++ *
++ * iOS pages are 16 KiB, and Playport 0.4.0's WoW64 memory rounds a decommit
++ * out to them, so the live 4 KiB pages beside the range go with it (fixed in
++ * the runtime after 0.4.0, madeira-unix 0107). Half-Life 2's allocator
++ * (tier0) commits its pools 64 KiB at a time and, when a map loads,
++ * decommits a pool's free tail from a 4 KiB boundary; client.dll then
++ * faulted on its object in the page before. Only the whole 16 KiB pages
++ * inside the range are decommitted here. The 4 KiB pages at its edges stay
++ * committed and are zeroed, as they would read when committed again. */
++#define HOST_PAGE_MASK 0x3fff
++
++/* Every page of [start, end) belongs to one allocation that is not free. */
++static BOOL one_allocation( char *start, char *end )
++{
++    MEMORY_BASIC_INFORMATION info;
++    void *base = NULL;
++    char *p;
++
++    for (p = start; p < end; p = (char *)info.BaseAddress + info.RegionSize)
++    {
++        if (!VirtualQuery( p, &info, sizeof(info) ) || info.State == MEM_FREE) return FALSE;
++        if (p != start && info.AllocationBase != base) return FALSE;
++        base = info.AllocationBase;
++    }
++    return TRUE;
++}
++
++static void zero_committed( char *start, char *end )
++{
++    MEMORY_BASIC_INFORMATION info;
++    char *p, *stop;
++
++    for (p = start; p < end; p = stop)
++    {
++        if (!VirtualQuery( p, &info, sizeof(info) )) return;
++        stop = min( end, (char *)info.BaseAddress + info.RegionSize );
++        if (info.State == MEM_COMMIT && !(info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
++            (info.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
++            memset( p, 0, stop - p );
++    }
++}
++
++/* TRUE with *ret set if the decommit was done here. */
++static BOOL decommit_host_pages( HANDLE process, void *addr, SIZE_T size, DWORD type, BOOL *ret )
++{
++    ULONG_PTR start = (ULONG_PTR)addr & ~0xfff, end = ((ULONG_PTR)addr + size + 0xfff) & ~0xfff;
++    ULONG_PTR inner_start = (start + HOST_PAGE_MASK) & ~HOST_PAGE_MASK, inner_end = end & ~HOST_PAGE_MASK;
++    void *base;
++    SIZE_T len;
++
++    if (type != MEM_DECOMMIT || !size || process != GetCurrentProcess()) return FALSE;
++    if (!((start | end) & HOST_PAGE_MASK) || end <= start) return FALSE;
++    if (!one_allocation( (char *)start, (char *)end )) return FALSE;
++
++    if (inner_start < inner_end)
++    {
++        base = (void *)inner_start;
++        len = inner_end - inner_start;
++        if (!(*ret = set_ntstatus( NtFreeVirtualMemory( process, &base, &len, MEM_DECOMMIT )))) return TRUE;
++        zero_committed( (char *)start, (char *)inner_start );
++        zero_committed( (char *)inner_end, (char *)end );
++    }
++    else zero_committed( (char *)start, (char *)end );
++    *ret = TRUE;
++    return TRUE;
++}
++#endif
++
+ BOOL WINAPI DECLSPEC_HOTPATCH VirtualFreeEx( HANDLE process, void *addr, SIZE_T size, DWORD type )
+ {
++#ifdef __i386__
++    BOOL ret;
++#endif
++
+     if (type == MEM_RELEASE && size)
+     {
+         WARN( "Trying to release memory with specified size.\n" );
+         SetLastError( ERROR_INVALID_PARAMETER );
+         return FALSE;
+     }
++#ifdef __i386__
++    if (decommit_host_pages( process, addr, size, type, &ret )) return ret;
++#endif
+     return set_ntstatus( NtFreeVirtualMemory( process, &addr, &size, type ));
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+
