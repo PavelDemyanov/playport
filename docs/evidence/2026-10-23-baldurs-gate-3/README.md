@@ -10,3 +10,4 @@ game needed.
   `call_catch_block4` and crashes in `_FindAndUnlinkFrame`. It applies to `main`'s Wine tree.
 - `bg3-lower-city-1.jpg`, `bg3-lower-city-2.jpg`: Act 3, the Lower City, 7.7 and 9.9 FPS, DXMT, Metal HUD on.
 - `bg3-nautiloid.jpg`: the Nautiloid, 14 FPS.
+- `bg3-temple-of-bhaal.jpg`: Act 3, the Temple of Bhaal, 32 FPS.
